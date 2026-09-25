@@ -10,6 +10,7 @@ from .greenwave import (
     MAX_CYCLE,
     MAX_INTERSECTIONS,
     MAX_OBSERVATIONS,
+    MAX_RESCHEDULE_TRIPS,
     MAX_WINDOW_SECONDS,
 )
 
@@ -358,4 +359,79 @@ class PlanSwitchRequest(GreenWaveRequest):
     intersections: list[PlanSwitchIntersection] = Field(
         ..., min_length=1, max_length=MAX_INTERSECTIONS,
         description="路口列表，1..8 个，每个路口均须携带 next_plan",
+    )
+
+
+class TimetableTrip(BaseModel):
+    """重排请求中的单个班次：只需给出原计划出发时刻（整数秒）。"""
+
+    model_config = ConfigDict(extra="ignore")
+
+    original_time: int = Field(
+        ...,
+        ge=0,
+        description=(
+            "该班原计划出发时刻（整数秒），必须落在发车范围 "
+            "[depart_from, depart_to) 内，且各班按此时刻严格递增"
+        ),
+    )
+
+
+class TimetableRescheduleRequest(GreenWaveRequest):
+    """班次重排请求：绿波路口参数与发车范围之外，另给班次序列与平移参数。"""
+
+    model_config = ConfigDict(extra="ignore")
+
+    trips: list[TimetableTrip] = Field(
+        ..., min_length=1, max_length=MAX_RESCHEDULE_TRIPS,
+        description="待重排班次列表，1..50 个，按 original_time 严格递增",
+    )
+    tolerance: int = Field(
+        ..., ge=0, le=MAX_WINDOW_SECONDS,
+        description=(
+            "每班最大平移秒数 tol（0..3600）：出发时刻必须满足 "
+            "|departure - original_time| <= tolerance"
+        ),
+    )
+    headway: int = Field(
+        ..., ge=1, le=MAX_WINDOW_SECONDS,
+        description=(
+            "相邻班次最小发车间隔 h（1..3600 秒）：departure[k] - "
+            "departure[k-1] >= headway"
+        ),
+    )
+
+    def validate_ranges(self) -> None:
+        """复用全部绿波 422 校验，并校验班次原时刻在范围内且严格递增。"""
+        super().validate_ranges()
+        errors: list[str] = []
+        previous: int | None = None
+        for index, trip in enumerate(self.trips):
+            if not self.depart_from <= trip.original_time < self.depart_to:
+                errors.append(
+                    f"trips[{index}].original_time 必须落在发车范围 "
+                    f"[{self.depart_from}, {self.depart_to}) 内"
+                )
+            if previous is not None and trip.original_time <= previous:
+                errors.append(
+                    "trips 必须按 original_time 严格递增"
+                    f"（trips[{index - 1}]={previous}, "
+                    f"trips[{index}]={trip.original_time}）"
+                )
+            previous = trip.original_time
+        if errors:
+            raise HTTPException(status_code=422, detail=errors)
+
+
+class TimetableRescheduleResponse(BaseModel):
+    """班次重排结果：按请求班次顺序给出的新出发时刻；无解时为 null。"""
+
+    departures: list[int] | None = Field(
+        ...,
+        description=(
+            "各班重排后的整数出发时刻，顺序与请求 trips 一致；每个出发时刻都"
+            "落在发车范围与全路口遇绿窗口内、距原时刻不超过 tolerance，相邻"
+            "班次间隔至少 headway，且总绝对平移秒数最小（同成本取字典序最早）；"
+            "无可行时刻表时为 null"
+        ),
     )

@@ -91,6 +91,25 @@ green_start / green_end）。到达时刻严格小于 S 的部分按旧计划判
   （rho=L 时 S 恰为绿灯终点不含），给出 t 上界
   ``S + L - rho - 1 - T_max``。混合整数段取交至多形成一条半开区间。三段
   各自裁剪、合并后再跨路口求交。
+
+班次重排（动态规划）
+--------------------
+:func:`compute_timetable_reschedule` 复用上述全路口公共可行窗口
+（:func:`compute_windows`，语义含跨零点绿灯先连续化再收缩、常绿不收缩）。
+给定 n 个按原时刻严格递增的班次，第 k 班只能在整数区间
+``[max(depart_from, p_k - tol), min(depart_to - 1, p_k + tol)]`` 与公共窗口
+的交集中选择出发秒，且相邻班次出发时刻之差至少为 ``headway``。目标是最小化
+总绝对平移 ``Σ|d_k - p_k|``，同成本时取按班次顺序字典序最早的出发时刻序列。
+
+这是带序约束的序列优化，**不能逐班贪心选最近可行时刻**：前一班选最近点可能
+把后续班次挤出窗口而无解，或迫使其产生更大平移。算法对公共窗口整数段做
+**动态规划**（窗口本身仍由区间运算得到，不逐秒判定灯色）：自最后一班向前，
+令 ``f_k(t)`` 为第 k 班在 t 出发时第 k..n-1 班的最小总成本，则
+``f_k(t) = |t-p_k| + min{f_{k+1}(u): u >= t+headway}``；该最小值是 f_{k+1}
+的后向滑动最小值，自右向左一次扫描即可维护，整体为 O(n × 窗口长度)。
+求出 ``f_0`` 的最小成本后，自前向后在每段窗口内取满足 ``d_k >= d_{k-1}+h``
+且使后续成本最优的**最小**整数时刻，即得同成本下字典序最早的唯一解；任一班
+无可行时刻则无解（返回 None）。
 """
 
 from __future__ import annotations
@@ -103,6 +122,7 @@ MAX_WINDOW_SECONDS = 3_600
 MAX_INTERSECTIONS = 8
 MAX_OBSERVATIONS = 2_000
 MAX_CONVOY_VEHICLES = 50
+MAX_RESCHEDULE_TRIPS = 50
 
 Interval = list[int]  # 长度为 2 的半开区间 [start, end)
 
@@ -843,3 +863,134 @@ def compute_plan_switch_windows(
         if not common:
             return []
     return merge_intervals(common or [])
+
+
+# ---------- 班次重排（动态规划） ----------
+
+
+def compute_timetable_reschedule(
+    intersections: Iterable[dict],
+    depart_from: int,
+    depart_to: int,
+    original_times: list[int],
+    tolerance: int,
+    headway: int,
+) -> list[int] | None:
+    """在全路口公共绿波窗口内为至多 50 个班次重排整数出发时刻。
+
+    ``original_times`` 为各班原时刻 ``p_k``（整数秒，已由请求侧校验为严格
+    递增且落在 ``[depart_from, depart_to)`` 内）。第 k 班的出发秒 ``d_k``
+    必须同时满足：
+
+    * 整数且 ``d_k ∈ [depart_from, depart_to)``；
+    * 在全路口公共可行窗口内（对 ``[travel, travel_max]`` 内任意实际行驶
+      时间在每个路口都遇绿，语义与 :func:`compute_windows` 完全一致）；
+    * ``|d_k - p_k| <= tolerance``；
+    * 相邻班次 ``d_k - d_{k-1} >= headway``（``d`` 因而也严格递增）。
+
+    在全部可行时刻表中最小化总绝对平移 ``Σ|d_k - p_k|``；同成本时取按班次
+    顺序**字典序最早**的出发时刻序列。无任何可行时刻表时返回 ``None``。
+
+    公共可行窗口先复用 :func:`compute_windows` 做区间运算得到（不逐秒判灯），
+    再在窗口的整数点上做自后向前的动态规划：
+
+        f_k(t) = |t - p_k| + min{ f_{k+1}(u) : u >= t + headway }
+
+    右端对 u 的约束是阈值后缀最小值，自右向左一次扫描即可维护，复杂度
+    O(n × 窗口整数点数)，与发车范围长度（<= 3600）和班次数（<= 50）同阶。
+    求出 f_0 的全局最小值后，自前向后在每段窗口内取满足序约束且达到最优
+    后续成本的最小整数时刻，即恢复出同成本下字典序最早的时刻表。**不逐班
+    贪心选最近时刻**：最近点可能把后续班次挤出窗口或迫使其更大平移。
+    """
+    trips = list(original_times)
+    n = len(trips)
+
+    # 全路口公共可行窗口（区间运算，不逐秒判灯）；窗口为空则任何班次都无解。
+    common = compute_windows(
+        intersections=intersections,
+        depart_from=depart_from,
+        depart_to=depart_to,
+    )
+    if not common:
+        return None
+
+    # 每班与 [p_k - tolerance, p_k + tolerance] ∩ [depart_from, depart_to)
+    # 取交后的允许窗口段（整数点集合）；任一班为空即无解。
+    trip_windows: list[list[Interval]] = []
+    for original in trips:
+        allowed = clip_intervals(
+            common,
+            max(depart_from, original - tolerance),
+            min(depart_to, original + tolerance + 1),
+        )
+        if not allowed:
+            return None
+        trip_windows.append(allowed)
+
+    INF = 10**18
+    # layers[k] 为一张 (偏移, 成本) 表，偏移 t - depart_from ∈ [0, length)，
+    # 仅第 k 班允许窗口内的整数点取有限值，表示 f_k(t)。
+    length = depart_to - depart_from
+    layers: list[list[int]] = []
+
+    # 末班：无后继约束，f_{n-1}(t) = |t - p_{n-1}|。
+    last_original = trips[-1]
+    last_layer = [INF] * length
+    for start, end in trip_windows[-1]:
+        for t in range(start, end):
+            last_layer[t - depart_from] = abs(t - last_original)
+    layers.append(last_layer)
+
+    # 自后向前：f_k(t) = |t - p_k| + min{ f_{k+1}(u) : u >= t + headway }。
+    # 后一层先转为阈值后缀最小值，自右向左一次扫描维护，不逐对 (t, u) 枚举。
+    for k in range(n - 2, -1, -1):
+        successor = layers[-1]
+        suffix_min = successor[:]
+        running = INF
+        for idx in range(length - 1, -1, -1):
+            if suffix_min[idx] > running:
+                suffix_min[idx] = running
+            else:
+                running = suffix_min[idx]
+
+        layer = [INF] * length
+        original = trips[k]
+        for start, end in trip_windows[k]:
+            for t in range(start, end):
+                j = t - depart_from + headway  # 后继 u >= t + headway 的首个偏移
+                best_next = suffix_min[j] if j < length else INF
+                if best_next < INF:
+                    layer[t - depart_from] = abs(t - original) + best_next
+        layers.append(layer)
+
+    layers.reverse()  # layers[k] 即 f_k
+
+    if min(layers[0]) >= INF:
+        return None
+
+    # 自前向后恢复同成本下字典序最早的时刻表：每段窗口内取满足
+    # d_k >= d_{k-1} + headway 且使 f_k 达到全局（剩余）最优值的最小整数点。
+    result: list[int] = []
+    lower = depart_from  # 第 k 班出发时刻的（含）下界
+    remaining = min(layers[0])  # 第 k..n-1 班尚需达到的最小成本
+    for k in range(n):
+        layer = layers[k]
+        chosen: int | None = None
+        for start, end in trip_windows[k]:
+            seg_lo = max(start, lower)
+            if seg_lo >= end:
+                continue
+            threshold = seg_lo - depart_from
+            for idx in range(threshold, end - depart_from):
+                if layer[idx] == remaining:
+                    chosen = idx + depart_from
+                    break
+            if chosen is not None:
+                break
+        if chosen is None:  # 理论上不可达：f_0 有限即存在完整路径
+            return None
+        result.append(chosen)
+        lower = chosen + headway
+        remaining -= abs(chosen - trips[k])
+
+    return result

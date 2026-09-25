@@ -7,6 +7,7 @@ from app.main import (
     green_wave_max_coverage,
     green_wave_offset_diagnostics,
     green_wave_slot_offsets,
+    green_wave_timetable_reschedule,
     green_wave_windows,
 )
 from app.schemas import (
@@ -15,6 +16,7 @@ from app.schemas import (
     Intersection,
     OffsetDiagnosticsRequest,
     SlotOffsetsRequest,
+    TimetableRescheduleRequest,
 )
 
 
@@ -724,3 +726,182 @@ def test_convoy_route_is_in_openapi():
     paths = app.openapi()["paths"]
     assert "/api/green-wave/convoy-starts" in paths
     assert "post" in paths["/api/green-wave/convoy-starts"]
+
+
+# ---------- POST /api/green-wave/timetable-reschedule ----------
+
+def make_reschedule_request(payload):
+    return TimetableRescheduleRequest.model_validate(payload)
+
+
+def test_reschedule_payload_shifts_trips():
+    # 绿灯 [0,20) 周期 60：贪心首班取 12 会把次班挤死，DP 给出 [9,19]
+    req = make_reschedule_request(
+        {
+            "depart_from": 0,
+            "depart_to": 120,
+            "tolerance": 10,
+            "headway": 10,
+            "trips": [
+                {"original_time": 12},
+                {"original_time": 19},
+            ],
+            "intersections": [
+                {"cycle": 60, "offset": 0, "green_start": 0,
+                 "green_end": 20, "travel": 0}
+            ],
+        }
+    )
+    resp = green_wave_timetable_reschedule(req)
+    assert resp.departures == [9, 19]
+
+
+def test_reschedule_payload_null_on_no_solution():
+    # 常绿路口，tol=0、h=10：原时刻间隔 5 无法拉开 ⇒ null
+    req = make_reschedule_request(
+        {
+            "depart_from": 0,
+            "depart_to": 60,
+            "tolerance": 0,
+            "headway": 10,
+            "trips": [
+                {"original_time": 0},
+                {"original_time": 5},
+            ],
+            "intersections": [
+                {"cycle": 60, "offset": 0, "green_start": 0,
+                 "green_end": 0, "travel": 0}
+            ],
+        }
+    )
+    assert green_wave_timetable_reschedule(req).departures is None
+
+
+def test_reschedule_rejects_empty_trips():
+    with pytest.raises(ValidationError):
+        make_reschedule_request(
+            {
+                "depart_from": 0,
+                "depart_to": 60,
+                "tolerance": 5,
+                "headway": 10,
+                "trips": [],
+                "intersections": [
+                    {"cycle": 60, "offset": 0, "green_start": 0,
+                     "green_end": 30, "travel": 0}
+                ],
+            }
+        )
+
+
+def test_reschedule_rejects_more_than_fifty_trips():
+    with pytest.raises(ValidationError):
+        make_reschedule_request(
+            {
+                "depart_from": 0,
+                "depart_to": 3000,
+                "tolerance": 5,
+                "headway": 1,
+                "trips": [{"original_time": i} for i in range(51)],
+                "intersections": [
+                    {"cycle": 60, "offset": 0, "green_start": 0,
+                     "green_end": 0, "travel": 0}
+                ],
+            }
+        )
+
+
+def test_reschedule_rejects_non_strictly_increasing_trips():
+    req = make_reschedule_request(
+        {
+            "depart_from": 0,
+            "depart_to": 60,
+            "tolerance": 5,
+            "headway": 10,
+            "trips": [
+                {"original_time": 10},
+                {"original_time": 10},
+            ],
+            "intersections": [
+                {"cycle": 60, "offset": 0, "green_start": 0,
+                 "green_end": 0, "travel": 0}
+            ],
+        }
+    )
+    with pytest.raises(HTTPException) as exc:
+        green_wave_timetable_reschedule(req)
+    assert exc.value.status_code == 422
+
+
+def test_reschedule_rejects_original_time_outside_range():
+    # 等于 depart_to（半开上界不含）同样非法
+    req = make_reschedule_request(
+        {
+            "depart_from": 10,
+            "depart_to": 60,
+            "tolerance": 5,
+            "headway": 10,
+            "trips": [
+                {"original_time": 20},
+                {"original_time": 60},
+            ],
+            "intersections": [
+                {"cycle": 60, "offset": 0, "green_start": 0,
+                 "green_end": 0, "travel": 0}
+            ],
+        }
+    )
+    with pytest.raises(HTTPException) as exc:
+        green_wave_timetable_reschedule(req)
+    assert exc.value.status_code == 422
+
+
+def test_reschedule_rejects_tolerance_and_headway_ranges():
+    base = {
+        "depart_from": 0,
+        "depart_to": 60,
+        "trips": [{"original_time": 10}],
+        "intersections": [
+            {"cycle": 60, "offset": 0, "green_start": 0,
+             "green_end": 0, "travel": 0}
+        ],
+    }
+    with pytest.raises(ValidationError):
+        make_reschedule_request({**base, "tolerance": -1, "headway": 10})
+    with pytest.raises(ValidationError):
+        make_reschedule_request({**base, "tolerance": 3601, "headway": 10})
+    with pytest.raises(ValidationError):
+        make_reschedule_request({**base, "tolerance": 5, "headway": 0})
+    with pytest.raises(ValidationError):
+        make_reschedule_request({**base, "tolerance": 5, "headway": 3601})
+    # 边界值合法：tolerance=0 与 3600、headway=1 与 3600
+    make_reschedule_request({**base, "tolerance": 0, "headway": 1})
+    make_reschedule_request({**base, "tolerance": 3600, "headway": 3600})
+
+
+def test_reschedule_reuses_green_wave_validation():
+    # 与 /windows 相同的跨字段校验：发车范围超过 3600 秒仍返回 422。
+    req = make_reschedule_request(
+        {
+            "depart_from": 0,
+            "depart_to": 3601,
+            "tolerance": 5,
+            "headway": 10,
+            "trips": [{"original_time": 10}],
+            "intersections": [
+                {"cycle": 60, "offset": 0, "green_start": 0,
+                 "green_end": 10, "travel": 0}
+            ],
+        }
+    )
+    with pytest.raises(HTTPException) as exc:
+        green_wave_timetable_reschedule(req)
+    assert exc.value.status_code == 422
+
+
+def test_reschedule_route_is_in_openapi():
+    from app.main import app
+
+    paths = app.openapi()["paths"]
+    assert "/api/green-wave/timetable-reschedule" in paths
+    assert "post" in paths["/api/green-wave/timetable-reschedule"]

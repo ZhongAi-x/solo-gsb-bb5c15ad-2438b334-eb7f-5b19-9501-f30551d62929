@@ -9,6 +9,7 @@ from .greenwave import (
     compute_max_coverage,
     compute_plan_switch_windows,
     compute_slot_offsets,
+    compute_timetable_reschedule,
     compute_windows,
     offset_diagnostics,
 )
@@ -22,6 +23,8 @@ from .schemas import (
     PlanSwitchRequest,
     SlotOffsetsRequest,
     SlotOffsetsResponse,
+    TimetableRescheduleRequest,
+    TimetableRescheduleResponse,
     Window,
 )
 
@@ -59,9 +62,16 @@ app = FastAPI(
         "next_plan（cycle、offset、green_start、green_end）。车辆到达时刻"
         "严格小于 switch_at 用旧计划，等于或大于时用新计划；切换点落在"
         "[travel, travel_max] 抵达波动区间内时两侧分别检查，不能只按最早"
-        "或最晚抵达选择计划。返回范围内全部极大半开发车窗口，无解返回空数组。"
+        "或最晚抵达选择计划。返回范围内全部极大半开发车窗口，无解返回空数组。\n\n"
+        "班次重排接口 `POST /api/green-wave/timetable-reschedule`：复用路口参数"
+        "与发车范围，另传 1..50 个按 original_time 严格递增的班次、每班最大"
+        "平移秒数 tolerance（0..3600）与最小发车间隔 headway（1..3600）。"
+        "为每班选择范围内的整数出发秒：处于全路口（对任意实际行驶时间）遇绿"
+        "窗口、距原时刻不超过 tolerance、相邻班次至少间隔 headway；在可行时刻"
+        "表中最小化总绝对平移秒数，同成本取按班次顺序字典序最早者，无解返回"
+        "null。基于公共窗口与动态规划（后向滑动最小值）求解，不逐班贪心。"
     ),
-    version="1.5.0",
+    version="1.6.0",
 )
 
 
@@ -227,3 +237,26 @@ def green_wave_plan_switch_windows(request: PlanSwitchRequest) -> list[Window]:
         switch_at=request.switch_at,
     )
     return [Window(start=start, end=end) for start, end in windows]
+
+
+@app.post(
+    "/api/green-wave/timetable-reschedule",
+    response_model=TimetableRescheduleResponse,
+    tags=["绿波"],
+    summary="班次重排：窗口与动态规划求总绝对平移最小的可行时刻表",
+)
+def green_wave_timetable_reschedule(
+    request: TimetableRescheduleRequest,
+) -> TimetableRescheduleResponse:
+    request.validate_ranges()
+    departures = compute_timetable_reschedule(
+        intersections=[
+            _intersection_payload(item) for item in request.intersections
+        ],
+        depart_from=request.depart_from,
+        depart_to=request.depart_to,
+        original_times=[trip.original_time for trip in request.trips],
+        tolerance=request.tolerance,
+        headway=request.headway,
+    )
+    return TimetableRescheduleResponse(departures=departures)
