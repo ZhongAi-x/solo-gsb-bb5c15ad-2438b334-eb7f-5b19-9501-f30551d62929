@@ -7,6 +7,7 @@ from app.main import (
     green_wave_max_coverage,
     green_wave_offset_diagnostics,
     green_wave_slot_offsets,
+    green_wave_timetable_reschedule,
     green_wave_windows,
 )
 from app.schemas import (
@@ -15,6 +16,7 @@ from app.schemas import (
     Intersection,
     OffsetDiagnosticsRequest,
     SlotOffsetsRequest,
+    TimetableRescheduleRequest,
 )
 
 
@@ -724,3 +726,186 @@ def test_convoy_route_is_in_openapi():
     paths = app.openapi()["paths"]
     assert "/api/green-wave/convoy-starts" in paths
     assert "post" in paths["/api/green-wave/convoy-starts"]
+
+
+# ---------- POST /api/green-wave/timetable-reschedule ----------
+
+def make_reschedule_request(payload):
+    return TimetableRescheduleRequest.model_validate(payload)
+
+
+def test_reschedule_payload_greedy_trap():
+    # 贪心第一班留在 25 会让第二班无点可选；DP 整体优化为 [24,29]
+    req = make_reschedule_request(
+        {
+            "depart_from": 0,
+            "depart_to": 120,
+            "original_departures": [25, 30],
+            "tolerance": 5,
+            "headway": 5,
+            "intersections": [
+                {"cycle": 60, "offset": 0, "green_start": 0,
+                 "green_end": 30, "travel": 0}
+            ],
+        }
+    )
+    resp = green_wave_timetable_reschedule(req)
+    assert resp is not None
+    assert resp.departures == [24, 29]
+    assert resp.shifts == [-1, -1]
+    assert resp.total_absolute_shift == 2
+
+
+def test_reschedule_keeps_original_when_feasible():
+    req = make_reschedule_request(
+        {
+            "depart_from": 0,
+            "depart_to": 60,
+            "original_departures": [0, 10, 20],
+            "tolerance": 0,
+            "headway": 5,
+            "intersections": [
+                {"cycle": 60, "offset": 0, "green_start": 0,
+                 "green_end": 30, "travel": 0}
+            ],
+        }
+    )
+    resp = green_wave_timetable_reschedule(req)
+    assert resp is not None
+    assert resp.departures == [0, 10, 20]
+    assert resp.shifts == [0, 0, 0]
+    assert resp.total_absolute_shift == 0
+
+
+def test_reschedule_returns_null_when_infeasible():
+    req = make_reschedule_request(
+        {
+            "depart_from": 0,
+            "depart_to": 60,
+            "original_departures": [0, 3],
+            "tolerance": 0,
+            "headway": 10,
+            "intersections": [
+                {"cycle": 60, "offset": 0, "green_start": 0,
+                 "green_end": 0, "travel": 0}
+            ],
+        }
+    )
+    assert green_wave_timetable_reschedule(req) is None
+
+
+def test_reschedule_rejects_non_strictly_increasing_trips():
+    req = make_reschedule_request(
+        {
+            "depart_from": 0,
+            "depart_to": 60,
+            "original_departures": [10, 10],
+            "tolerance": 5,
+            "headway": 5,
+            "intersections": [
+                {"cycle": 60, "offset": 0, "green_start": 0,
+                 "green_end": 30, "travel": 0}
+            ],
+        }
+    )
+    with pytest.raises(HTTPException) as exc:
+        green_wave_timetable_reschedule(req)
+    assert exc.value.status_code == 422
+
+
+def test_reschedule_rejects_trip_outside_range():
+    req = make_reschedule_request(
+        {
+            "depart_from": 10,
+            "depart_to": 60,
+            "original_departures": [5],
+            "tolerance": 5,
+            "headway": 5,
+            "intersections": [
+                {"cycle": 60, "offset": 0, "green_start": 0,
+                 "green_end": 30, "travel": 0}
+            ],
+        }
+    )
+    with pytest.raises(HTTPException) as exc:
+        green_wave_timetable_reschedule(req)
+    assert exc.value.status_code == 422
+
+
+def test_reschedule_rejects_trip_count_out_of_range():
+    base = {
+        "depart_from": 0,
+        "depart_to": 3000,
+        "tolerance": 5,
+        "headway": 5,
+        "intersections": [
+            {"cycle": 60, "offset": 0, "green_start": 0,
+             "green_end": 0, "travel": 0}
+        ],
+    }
+    with pytest.raises(ValidationError):
+        make_reschedule_request({**base, "original_departures": []})
+    with pytest.raises(ValidationError):
+        make_reschedule_request(
+            {**base, "original_departures": list(range(0, 255, 5))}
+        )
+
+
+def test_reschedule_rejects_tolerance_and_headway_ranges():
+    base = {
+        "depart_from": 0,
+        "depart_to": 60,
+        "original_departures": [10],
+        "headway": 5,
+        "intersections": [
+            {"cycle": 60, "offset": 0, "green_start": 0,
+             "green_end": 0, "travel": 0}
+        ],
+    }
+    with pytest.raises(ValidationError):
+        make_reschedule_request({**base, "tolerance": -1})
+    with pytest.raises(ValidationError):
+        make_reschedule_request({**base, "tolerance": 3601})
+    with pytest.raises(ValidationError):
+        make_reschedule_request(
+            {**base, "tolerance": 5, "headway": 0}
+        )
+    with pytest.raises(ValidationError):
+        make_reschedule_request(
+            {**base, "tolerance": 5, "headway": 3601}
+        )
+
+
+def test_reschedule_reuses_green_wave_validation():
+    # 与 /windows 相同的跨字段校验：发车范围超过 3600 秒仍返回 422。
+    req = make_reschedule_request(
+        {
+            "depart_from": 0,
+            "depart_to": 3601,
+            "original_departures": [10],
+            "tolerance": 5,
+            "headway": 5,
+            "intersections": [
+                {"cycle": 60, "offset": 0, "green_start": 0,
+                 "green_end": 10, "travel": 0}
+            ],
+        }
+    )
+    with pytest.raises(HTTPException) as exc:
+        green_wave_timetable_reschedule(req)
+    assert exc.value.status_code == 422
+
+
+def test_reschedule_route_is_in_openapi():
+    from app.main import app
+
+    paths = app.openapi()["paths"]
+    path = "/api/green-wave/timetable-reschedule"
+    assert path in paths
+    assert "post" in paths[path]
+    # 无解时响应体为 null（response_model 允许 None）
+    schema = app.openapi()
+    response = schema["paths"][path]["post"]["responses"]["200"]
+    ref = response["content"]["application/json"]["schema"]
+    assert {"type": "null"} in ref["anyOf"]
+    assert any("$ref" in item for item in ref["anyOf"])

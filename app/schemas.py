@@ -10,6 +10,7 @@ from .greenwave import (
     MAX_CYCLE,
     MAX_INTERSECTIONS,
     MAX_OBSERVATIONS,
+    MAX_RESCHEDULE_TRIPS,
     MAX_WINDOW_SECONDS,
 )
 
@@ -358,4 +359,76 @@ class PlanSwitchRequest(GreenWaveRequest):
     intersections: list[PlanSwitchIntersection] = Field(
         ..., min_length=1, max_length=MAX_INTERSECTIONS,
         description="路口列表，1..8 个，每个路口均须携带 next_plan",
+    )
+
+
+# ---------- 班次重排 ----------
+
+
+class TimetableRescheduleRequest(GreenWaveRequest):
+    """班次重排请求：绿波请求基础上增加原班次时刻、平移容限与最小发车间隔。"""
+
+    model_config = ConfigDict(extra="ignore")
+
+    original_departures: list[int] = Field(
+        ...,
+        min_length=1,
+        max_length=MAX_RESCHEDULE_TRIPS,
+        description=(
+            "各班原计划出发时刻（整数秒），1..50 个，必须严格递增；"
+            "且每个原时刻均须落在半开发车范围 [depart_from, depart_to) 内"
+        ),
+    )
+    tolerance: int = Field(
+        ..., ge=0, le=MAX_WINDOW_SECONDS,
+        description="每班最大平移秒数 tol（0..3600）：新时刻须满足 |x - 原时刻| <= tol",
+    )
+    headway: int = Field(
+        ..., ge=1, le=MAX_WINDOW_SECONDS,
+        description="相邻班次最小发车间隔 h（1..3600 秒）：相邻新时刻之差须 >= h",
+    )
+
+    def validate_ranges(self) -> None:
+        """复用全部绿波 422 校验，并校验原班次时刻严格递增且处于发车范围内。"""
+        super().validate_ranges()
+        errors: list[str] = []
+        trips = self.original_departures
+        for index, value in enumerate(trips):
+            if not self.depart_from <= value < self.depart_to:
+                errors.append(
+                    f"original_departures[{index}] = {value} 必须落在发车范围 "
+                    f"[{self.depart_from}, {self.depart_to}) 内"
+                )
+        for index in range(1, len(trips)):
+            if trips[index] <= trips[index - 1]:
+                errors.append(
+                    "original_departures 必须按原时刻严格递增"
+                    f"（第 {index - 1} 班 {trips[index - 1]} 之后第 {index} 班 "
+                    f"{trips[index]} 未严格增大）"
+                )
+                break
+        if errors:
+            raise HTTPException(status_code=422, detail=errors)
+
+
+class TimetableRescheduleResponse(BaseModel):
+    """班次重排结果：新出发时刻、逐班平移秒数与总绝对平移秒数。"""
+
+    departures: list[int] = Field(
+        ...,
+        description=(
+            "各班重排后的整数出发时刻（秒），与 original_departures 一一对应、"
+            "严格递增、相邻间隔 >= headway，每班均在全路口遇绿窗口内且相对原时刻"
+            "平移不超过 tolerance；总绝对平移最小，同成本取字典序最早"
+        ),
+    )
+    shifts: list[int] = Field(
+        ...,
+        description=(
+            "逐班平移秒数 departures[j] - original_departures[j]（正=延后、"
+            "负=提前、0=保持原时刻），绝对值均不超过 tolerance"
+        ),
+    )
+    total_absolute_shift: int = Field(
+        ..., ge=0, description="总绝对平移秒数 sum(abs(shift))，所有可行时刻表中的最小值"
     )

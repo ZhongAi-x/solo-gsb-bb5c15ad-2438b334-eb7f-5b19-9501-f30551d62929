@@ -2,7 +2,7 @@
 
 基于 **Python 3.11 + FastAPI** 的干线（arterial）绿波发车窗口计算服务。
 
-提供六个接口：
+提供七个接口：
 
 1. **绿波发车窗口** `POST /api/green-wave/windows`：给定干线上至多 8 个路口各自的
    信号周期、相位偏移、周期内绿灯半开区间（允许跨周期零点）以及从起点到该路口的
@@ -43,6 +43,14 @@
    区间、跨周期零点与常绿语义与其余接口完全一致。服务返回范围内全部极大半开发车窗口，
    其中每个整数秒出发、对各路口 `[travel, travel_max]` 内**任意实数**行驶时间，按
    实际到达时刻适用的计划均遇绿；无解返回空数组 `[]`。
+7. **班次重排** `POST /api/green-wave/timetable-reschedule`：复用绿波窗口接口的路口信号、
+   行驶时间波动与发车范围，另传 **1～50 个**按原时刻**严格递增**的班次
+   `original_departures`、每班最大平移秒数 `tolerance`（`0..3600`）与最小发车间隔
+   `headway`（`1..3600`）。为每班选择范围内的**整数出发秒**：必须处于**全路口遇绿
+   窗口**（对 `travel` 到 `travel_max` 的任意实际行驶时间遇绿）、相对该班原时刻平移不
+   超过 `tolerance`，且相邻班次至少间隔 `headway`。服务在所有可行时刻表中最小化
+   **总绝对平移秒数**，总平移相同时取按班次顺序**字典序最早**的结果；基于遇绿窗口与
+   **动态规划**求解（**不逐班贪心选最近时刻**），无可行时刻表时响应体为 `null`。
 
 ## 目录结构
 
@@ -107,6 +115,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | 整段时隙可调 offset | `POST http://localhost:8000/api/green-wave/slot-offsets` |
 | 车队首车发车窗口 | `POST http://localhost:8000/api/green-wave/convoy-starts` |
 | 计划切换发车窗口 | `POST http://localhost:8000/api/green-wave/plan-switch-windows` |
+| 班次重排 | `POST http://localhost:8000/api/green-wave/timetable-reschedule` |
 | 交互式文档（Swagger UI） | `http://localhost:8000/docs` |
 | OpenAPI 描述 | `http://localhost:8000/openapi.json` |
 
@@ -822,6 +831,167 @@ curl -s -X POST http://localhost:8000/api/green-wave/plan-switch-windows \
 3. 三段结果裁剪进发车范围、合并相邻区间后，跨路口两两求交，即得全部极大半开发车
    窗口。全程只做区间运算，不逐秒试探；无任何可行整数秒时返回空数组。
 
+## 班次重排
+
+`POST /api/green-wave/timetable-reschedule` 用于已有班次时刻表的小幅调整：在不改变
+路口信号配时的前提下，把 1～50 个班次各自**平移**到一个整数出发秒，使每一班都能全程
+遇绿，同时尽量贴近原计划时刻。路口信号、`travel` / `travel_max` 行驶时间波动与发车
+范围参数与 `/windows` 完全相同（同样的跨零点连续化、波动右端收缩、常绿不收缩、半开
+边界语义），另增加：
+
+| 字段 | 类型 | 约束 |
+| --- | --- | --- |
+| `original_departures` | int[] | **1..50** 个整数秒，按原时刻**严格递增**，且每个都须落在半开发车范围 `[depart_from, depart_to)` 内 |
+| `tolerance` | int | 每班最大平移秒数，`0..3600`；新时刻 `x` 须满足 `|x - 原时刻| <= tolerance` |
+| `headway` | int | 相邻班次最小发车间隔，`1..3600`；重排后相邻出发时刻之差须 `>= headway` |
+
+为第 `j` 班选择整数出发秒 `x_j` 时必须同时满足：
+
+1. `depart_from <= x_j < depart_to`，且 `x_j` 处于**全路口遇绿窗口**（对
+   `[travel, travel_max]` 内**任意实数**行驶时间抵达每个路口都遇绿）；
+2. `|x_j - original_departures[j]| <= tolerance`；
+3. `x_j - x_{j-1} >= headway`（因输入严格递增且 `headway >= 1`，结果必然严格递增）。
+
+在全部可行时刻表中最小化总绝对平移
+
+```
+cost = Σ_j |x_j - original_departures[j]|
+```
+
+总平移相同时取**按班次顺序字典序最早**的时刻表（第一班最早；第一班相同再比第二班，
+依此类推）。无任何可行时刻表时响应体为 JSON `null`；成功时返回：
+
+```json
+{
+  "departures": [24, 29],
+  "shifts": [-1, -1],
+  "total_absolute_shift": 2
+}
+```
+
+- `departures`：各班重排后的整数出发时刻，与 `original_departures` 一一对应；
+- `shifts`：逐班平移秒数 `departures[j] - original_departures[j]`（正数延后、负数
+  提前、`0` 保持原时刻）；
+- `total_absolute_shift`：总绝对平移秒数 `Σ|shift|`，即所有可行时刻表中的最小值。
+
+### 示例 1：逐班贪心会失败，整体 DP 才能求解
+
+绿灯 `[0,30)` 周期 60、无行驶波动，发车范围 `[0,120)`；两班原时刻 25、30，每班容限
+5 秒、最小间隔 5 秒。**逐班贪心**（第一班选离 25 最近的可行点，即留在 25）会让第二
+班在 `[30,35]` 内没有任何遇绿点（30 是绿灯终点不含，下一窗口要到 60），从而误判无
+解；动态规划整体权衡后把两班各提前 1 秒，得到 `[24,29]`，总平移 2 秒：
+
+```bash
+curl -s -X POST http://localhost:8000/api/green-wave/timetable-reschedule \
+  -H "Content-Type: application/json" \
+  -d '{
+    "depart_from": 0,
+    "depart_to": 120,
+    "original_departures": [25, 30],
+    "tolerance": 5,
+    "headway": 5,
+    "intersections": [
+      {"cycle": 60, "offset": 0, "green_start": 0, "green_end": 30, "travel": 0}
+    ]
+  }'
+```
+
+响应：
+
+```json
+{"departures":[24,29],"shifts":[-1,-1],"total_absolute_shift":2}
+```
+
+### 示例 2：全部保持原时刻
+
+原时刻本身都在遇绿窗口内、相邻间隔也达标时，最优成本为 0，各班保持不变：
+
+```bash
+curl -s -X POST http://localhost:8000/api/green-wave/timetable-reschedule \
+  -H "Content-Type: application/json" \
+  -d '{
+    "depart_from": 0,
+    "depart_to": 300,
+    "original_departures": [0, 60, 120],
+    "tolerance": 30,
+    "headway": 30,
+    "intersections": [
+      {"cycle": 60, "offset": 0,  "green_start": 0, "green_end": 30, "travel": 0},
+      {"cycle": 60, "offset": 30, "green_start": 0, "green_end": 30, "travel": 30}
+    ]
+  }'
+# {"departures":[0,60,120],"shifts":[0,0,0],"total_absolute_shift":0}
+```
+
+### 示例 3：字典序 tie-break
+
+常绿路口（`green_start == green_end`）、发车范围 `[0,60)`，原时刻 10、12，容限 10、
+最小间隔 10。可行最优成本为 8：`[2,12]`（平移 8+0）与 `[10,20]`（0+8）等总成本，
+按班次顺序字典序最早取 `[2,12]`：
+
+```bash
+curl -s -X POST http://localhost:8000/api/green-wave/timetable-reschedule \
+  -H "Content-Type: application/json" \
+  -d '{
+    "depart_from": 0,
+    "depart_to": 60,
+    "original_departures": [10, 12],
+    "tolerance": 10,
+    "headway": 10,
+    "intersections": [
+      {"cycle": 60, "offset": 0, "green_start": 0, "green_end": 0, "travel": 0}
+    ]
+  }'
+# {"departures":[2,12],"shifts":[-8,0],"total_absolute_shift":8}
+```
+
+### 示例 4：无可行时刻表返回 null
+
+容限为 0 而原时刻相邻间隔小于 `headway` 时没有任何调整空间，响应体即 JSON `null`
+（HTTP 状态码仍为 200）：
+
+```bash
+curl -s -X POST http://localhost:8000/api/green-wave/timetable-reschedule \
+  -H "Content-Type: application/json" \
+  -d '{
+    "depart_from": 0,
+    "depart_to": 60,
+    "original_departures": [0, 3],
+    "tolerance": 0,
+    "headway": 10,
+    "intersections": [
+      {"cycle": 60, "offset": 0, "green_start": 0, "green_end": 0, "travel": 0}
+    ]
+  }'
+# null
+```
+
+### 班次重排的算法说明（遇绿窗口 + 动态规划，不逐班贪心）
+
+1. **逐秒可行性展开**：对全部路口复用第 1、2 步的单车可行窗口（跨零点先连续化、波动
+   右端收缩、常绿不收缩），把合并后的极大半开窗口 `[a,b)` 展开成发车范围上的逐秒
+   布尔标记——整数秒 `t` 可行当且仅当落在某条窗口内；
+2. **逐班候选秒**：第 `j` 班的候选集合为遇绿秒 ∩ 容限窗
+   `[o_j-tolerance, o_j+tolerance]` ∩ 发车范围，按升序排列，至多 3600 个；任一班无
+   候选即无解；
+3. **正向动态规划**：令 `f_j(t)` 为第 `j` 班在 `t` 出发时前 `j+1` 班的最小总平移，
+
+   ```
+   f_j(t) = |t - o_j| + min{ f_{j-1}(s) : s <= t - headway }
+   ```
+
+   候选秒升序扫描，用单调游标维护允许集合内 `f_{j-1}` 的最小值，每次转移 O(1)。
+   最后一班的最小 `f` 即最优总成本 `C*`；不存在有限值则返回 `null`；
+4. **字典序最早解的重建**：对称地做后缀 DP
+   `b_j(t) = |t-o_j| + min{ b_{j+1}(s) : s >= t+headway }`（候选降序扫描，同样 O(1)
+   转移）。随后自第一班起逐班在满足间隔与遇绿/容限的候选中取**最小**的 `t`，使
+   "已确定前缀成本 + `b_j(t)`"恰好等于 `C*`。这在最优解集合内逐位取最小，得到的就是
+   字典序最早的全局最优时刻表。
+
+复杂度约为 `O(班次数 × 每班候选数)`，50 班、3600 秒范围、容限 3600 的最坏规模下候选
+上限约 18 万次 O(1) 转移，亚秒级完成；**不逐班贪心选最近时刻**（贪心会把后续班次挤出
+遇绿窗口或顶破 headway，见示例 1），也不枚举时刻表组合。
+
 ## 输入校验与错误
 
 无效周期、相位偏移、绿灯端点、行驶时间（含 `travel_max < travel` 或
@@ -874,6 +1044,26 @@ curl -s -X POST http://localhost:8000/api/green-wave/plan-switch-windows \
 { "detail": ["next_plan.offset 必须满足 0 <= offset < cycle（路口 cycle=60）"] }
 ```
 
+`/api/green-wave/timetable-reschedule` 沿用绿波窗口接口的**全部** 422 校验（路口
+参数、`travel_max` 上下界、发车范围长度、路口数等），并额外要求：
+
+- `original_departures` 数量在 **1..50**（字段级 422）；
+- 每个原时刻都落在半开发车范围 `[depart_from, depart_to)` 内（跨字段 422，错误信息带
+  下标与时刻）；
+- 原时刻必须**严格递增**（跨字段 422，错误信息带下标）；
+- `tolerance ∈ [0, 3600]`、`headway ∈ [1, 3600]`（字段级 422）。
+
+注意：`headway` 或 `tolerance` 导致**不存在可行时刻表**属于业务结果而非请求错误，
+HTTP 状态码为 200、响应体为 `null`（不会返回 422）。例如：
+
+```json
+{ "detail": ["original_departures 必须按原时刻严格递增（第 0 班 10 之后第 1 班 10 未严格增大）"] }
+```
+
+```json
+{ "detail": ["original_departures[0] = 5 必须落在发车范围 [10, 60) 内"] }
+```
+
 ## 算法说明（区间运算，不逐秒试探）
 
 1. **周期内展开与波动收缩**：每个路口的绿灯半开区间先展开为连续分量
@@ -906,6 +1096,13 @@ curl -s -X POST http://localhost:8000/api/green-wave/plan-switch-windows \
 下界、新侧上界，半开 / 闭端端点语义不同），三段合并后跨路口求交，复杂度与窗口
 接口同阶。
 
+`/api/green-wave/timetable-reschedule` 先复用第 1、2 步把全路口遇绿窗口展开成逐秒
+标记，再对各班候选秒做动态规划：正向 `f_j(t) = |t-o_j| + min f_{j-1}(s)`
+（`s <= t-headway`，游标维护前缀最小值，O(1) 转移）求最优总成本；对称的后缀 DP
+配合自前向后逐位取最小候选秒重建字典序最早的最优时刻表。复杂度
+`O(班次数 × 每班候选数)`（上限 50 × 3600 次 O(1) 转移），不逐班贪心、不枚举时刻表
+组合。
+
 ## 运行测试
 
 ```bash
@@ -930,4 +1127,9 @@ pytest -q
 覆盖切换点落在抵达波动区间内时两侧必须同时满足（不能只按最早或最晚抵达
 选择计划）、切换点恰为绿灯起点 / 终点的半开端点语义、`slack=0` 单点到达、
 新旧计划周期不同、`switch_at` 为负或落在发车范围外及 `next_plan` 的 422
-校验等场景。
+校验等场景；班次重排
+另有 3000 组随机参数下与逐班枚举候选秒的动态规划暴力参考实现（直接最小化
+`(总成本, 时刻表元组)`）的逐项对照，并覆盖逐班贪心选最近点导致误判无解的
+陷阱用例、同成本字典序 tie-break（单班与多班联动）、容限 0、headway 顶破
+原时刻、半开绿灯 / 范围右端边界、跨零点绿灯、行驶时间波动收缩候选、50 班
+上界性能、无解返回 `null` 及 422 校验等场景。

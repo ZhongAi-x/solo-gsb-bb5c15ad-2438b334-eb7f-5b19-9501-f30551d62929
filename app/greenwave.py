@@ -91,6 +91,20 @@ green_start / green_end）。到达时刻严格小于 S 的部分按旧计划判
   （rho=L 时 S 恰为绿灯终点不含），给出 t 上界
   ``S + L - rho - 1 - T_max``。混合整数段取交至多形成一条半开区间。三段
   各自裁剪、合并后再跨路口求交。
+
+班次重排
+--------
+:func:`compute_timetable_reschedule` 复用上述**单车可行窗口**，把 n
+（1..50）个按原时刻严格递增的班次各自平移到范围内的整数出发秒：第 j 班
+候选秒为全路口遇绿窗口与原时刻 ±tolerance 容限窗（再与发车范围）的交集。
+相邻班次出发时刻至少间隔 headway，目标是最小化总绝对平移，同成本取按班次
+顺序字典序最早的时刻表，无可行解返回 ``None``。
+
+逐班贪心选最近可行点不正确（局部最优会把后续班次挤出窗口或顶破
+headway），故采用动态规划：正向 ``f_j(t) = |t-o_j| + min f_{j-1}(s)``
+（``s <= t-headway``，候选升序扫描、游标维护前缀最小值）；字典序 tie-break
+用对称的后缀 DP ``b_j(t)``，得到最优总成本后自前向后逐班取使前缀成本加
+后缀成本等于最优值的最小候选秒。
 """
 
 from __future__ import annotations
@@ -103,6 +117,7 @@ MAX_WINDOW_SECONDS = 3_600
 MAX_INTERSECTIONS = 8
 MAX_OBSERVATIONS = 2_000
 MAX_CONVOY_VEHICLES = 50
+MAX_RESCHEDULE_TRIPS = 50
 
 Interval = list[int]  # 长度为 2 的半开区间 [start, end)
 
@@ -843,3 +858,155 @@ def compute_plan_switch_windows(
         if not common:
             return []
     return merge_intervals(common or [])
+
+
+# ---------- 班次重排（timetable reschedule） ----------
+
+
+def _departure_feasibility(
+    intersections: list[dict], depart_from: int, depart_to: int
+) -> bytearray:
+    """发车范围内逐整数秒的全路口遇绿可行性（复用单车可行窗口）。
+
+    与 :func:`compute_windows` 语义完全一致（跨零点先连续化再收缩、常绿不
+    收缩、半开边界），但把合并后的极大半开窗口 ``[a,b)`` 展开成逐秒标记：
+    整数秒 t 可行当且仅当它落在某条窗口内。长度为
+    ``depart_to - depart_from``，第 ``t - depart_from`` 位对应整数秒 t。
+    """
+    feasible = bytearray(depart_to - depart_from)
+    for start, end in compute_windows(intersections, depart_from, depart_to):
+        feasible[start - depart_from:end - depart_from] = b"\x01" * (end - start)
+    return feasible
+
+
+def compute_timetable_reschedule(
+    intersections: Iterable[dict],
+    depart_from: int,
+    depart_to: int,
+    original_departures: list[int],
+    tolerance: int,
+    headway: int,
+) -> list[int] | None:
+    """班次重排：在遇绿窗口与平移容限内求总绝对平移最小的整数时刻表。
+
+    给定 n 个按原时刻**严格递增**的班次（``original_departures``，
+    1 <= n <= 50），为第 j 班选择整数出发秒 ``x_j``，满足：
+
+    * ``x_j`` 落在发车范围 ``[depart_from, depart_to)`` 内，且处于**全路口
+      遇绿窗口**（与 :func:`compute_windows` 完全相同的行驶时间波动语义）；
+    * ``|x_j - original_departures[j]| <= tolerance``；
+    * 相邻班次 ``x_j - x_{j-1} >= headway``。
+
+    在所有可行时刻表中最小化总绝对平移
+    ``sum_j |x_j - original_departures[j]|``；总平移相同时取按班次顺序
+    **字典序最早**（第一班最早；第一班相同则第二班最早，依此类推）的时刻
+    表。无可行时刻表时返回 ``None``。
+
+    求解基于上述可行窗口做**动态规划**，不能逐班贪心选最近时刻：为某班选
+    局部最近的可行点可能把后续班次挤出遇绿窗口或顶破 headway（见
+    tests/test_timetable_reschedule.py 的 greedy trap 用例）。
+
+    正向 DP：``f_j(t)`` 为第 j 班在 t 出发时前 j+1 班的最小总平移，转移
+
+        f_j(t) = |t - o_j| + min{ f_{j-1}(s) : s <= t - headway }。
+
+    候选秒按升序扫描，用游标维护允许集合的最小值，转移 O(1)；单班候选至多
+    ``min(2×tolerance+1, 范围长度)`` 个（tolerance 最大 3600、范围最长
+    3600 秒，故至多 3600 个）。
+
+    字典序 tie-break 借助**后缀 DP** 重建：``b_j(t)`` 为第 j 班在 t 出发时
+    后 n-j 班可达到的最小后缀平移，转移
+
+        b_j(t) = |t - o_j| + min{ b_{j+1}(s) : s >= t + headway }
+
+    （候选秒降序扫描，同样 O(1) 转移）。得到最优总成本 C* 后，自第一班起
+    逐班在满足 headway 与遇绿/容限的候选中取**最小**的 t，使前缀成本与后缀
+    成本之和恰为 C*——该取法在最优解集合内逐位取最小，即字典序最早的全局
+    最优解。全程窗口运算 + 区间 DP，不逐班贪心、亦不枚举时刻表组合。
+    """
+    nodes = list(intersections)
+    trips = list(original_departures)
+    n_trips = len(trips)
+
+    green = _departure_feasibility(nodes, depart_from, depart_to)
+
+    # 各班候选秒（升序）：全路口遇绿 ∩ [o_j - tolerance, o_j + tolerance]
+    # ∩ [depart_from, depart_to)。任一班无候选即整体无解。
+    candidates: list[list[int]] = []
+    for origin in trips:
+        lo = max(depart_from, origin - tolerance)
+        hi = min(depart_to, origin + tolerance + 1)  # 半开上界
+        if lo >= hi:
+            return None
+        row = [t for t in range(lo, hi) if green[t - depart_from]]
+        if not row:
+            return None
+        candidates.append(row)
+
+    inf = n_trips * (tolerance + 1)  # 大于任何可达成本的哨兵值
+
+    # ---------- 正向 DP：f_j(t) ----------
+    prev_row = candidates[0]
+    prev_cost = [abs(t - trips[0]) for t in prev_row]
+    for j in range(1, n_trips):
+        row = candidates[j]
+        cur_cost = [inf] * len(row)
+        best = inf
+        p = 0
+        for i, t in enumerate(row):
+            limit = t - headway
+            while p < len(prev_row) and prev_row[p] <= limit:
+                if prev_cost[p] < best:
+                    best = prev_cost[p]
+                p += 1
+            if best < inf:
+                cur_cost[i] = abs(t - trips[j]) + best
+        prev_row, prev_cost = row, cur_cost
+
+    optimal = min(prev_cost)
+    if optimal >= inf:
+        return None
+
+    # ---------- 后缀 DP：b_j(t)，逐班保存以供字典序重建 ----------
+    # suffix[j][i] = b_j(candidates[j][i])；最后一班即局部平移成本。
+    suffix: list[list[int]] = [[] for _ in range(n_trips)]
+    suffix[-1] = [abs(t - trips[-1]) for t in candidates[-1]]
+    for j in range(n_trips - 2, -1, -1):
+        row = candidates[j]
+        nxt = candidates[j + 1]
+        nxt_cost = suffix[j + 1]
+        cur_cost = [inf] * len(row)
+        best = inf
+        p = len(nxt) - 1
+        for i in range(len(row) - 1, -1, -1):
+            floor = row[i] + headway
+            while p >= 0 and nxt[p] >= floor:
+                if nxt_cost[p] < best:
+                    best = nxt_cost[p]
+                p -= 1
+            if best < inf:
+                cur_cost[i] = abs(row[i] - trips[j]) + best
+        suffix[j] = cur_cost
+
+    # ---------- 字典序最早的最优解：自前向后逐班取最小可行 t ----------
+    result: list[int] = []
+    prefix_cost = 0
+    prev_t: int | None = None
+    for j, row in enumerate(candidates):
+        chosen: int | None = None
+        start = 0
+        if prev_t is not None:
+            floor = prev_t + headway
+            while start < len(row) and row[start] < floor:
+                start += 1
+        for i in range(start, len(row)):
+            t = row[i]
+            if prefix_cost + suffix[j][i] == optimal:
+                chosen = t
+                prefix_cost += abs(t - trips[j])
+                break
+        if chosen is None:  # 理论不可达：optimal 可行时每步必有候选
+            return None
+        result.append(chosen)
+        prev_t = chosen
+    return result
